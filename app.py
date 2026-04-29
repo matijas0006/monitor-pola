@@ -10,12 +10,11 @@ CDSE_S2L2A = DataCollection.define(
     api_id="sentinel-2-l2a",
     service_url="https://sh.dataspace.copernicus.eu"
 )
-# --- 1. KONFIGURACJA KLUCZY ---
-# Pamiętaj: Client Secret widzisz tylko raz przy tworzeniu klucza!
 
+# --- 1. KONFIGURACJA KLUCZY ---
 config = SHConfig()
-config.sh_client_id = 'sh-f48096a8-42c9-40af-8c8f-db4eb69b1422'
-config.sh_client_secret = 'B3VX7e8IRf8yaSsmo9Z6GIJhSKDEwdCo'
+config.sh_client_id = st.secrets["SH_CLIENT_ID"]
+config.sh_client_secret = st.secrets["SH_CLIENT_SECRET"]
 config.sh_base_url = 'https://sh.dataspace.copernicus.eu'
 config.sh_token_url = 'https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token'
 config.save()
@@ -34,13 +33,16 @@ st.set_page_config(page_title="Monitor Pola Taty", layout="centered")
 st.title("🚜 Monitoring Pola: 40 ha")
 
 st.sidebar.header("Ustawienia")
-# Domyślnie ustawiamy datę na dzisiejszą (kwiecień 2026)
 data_widoku = st.sidebar.date_input("Wybierz datę analizy", value=datetime.date(2026, 4, 15))
+st.sidebar.markdown("---")
+typ_analizy = st.sidebar.radio(
+    "Wybierz rodzaj analizy:",
+    ("Kondycja roślin (NDVI)", "Wilgotność (NDWI)")
+)
 
-if st.button('Pobierz stan roślin (NDVI)'):
+if st.button('Pobierz analizę z satelity'):
     with st.spinner('Łączę się z satelitą Sentinel-2...'):
         try:
-            # Określamy zakres czasu (+/- 15 dni od wybranej daty)
             start_dt = (data_widoku - datetime.timedelta(days=15)).strftime('%Y-%m-%d')
             end_dt = data_widoku.strftime('%Y-%m-%d')
 
@@ -48,14 +50,14 @@ if st.button('Pobierz stan roślin (NDVI)'):
             //VERSION=3
             function setup() {
               return {
-                input: ["B02", "B03", "B04", "B08"],
-                output: { bands: 4, sampleType: "FLOAT32" }
+                input: ["B02", "B03", "B04", "B08", "B11"],
+                output: { bands: 5, sampleType: "FLOAT32" }
               };
             }
             function evaluatePixel(sample) {
               let ndvi = (sample.B08 - sample.B04) / (sample.B08 + sample.B04);
-              // Zwracamy pasma RGB (rozjaśnione *2.5) oraz NDVI w czwartej warstwie
-              return [sample.B04 * 2.5, sample.B03 * 2.5, sample.B02 * 2.5, ndvi];
+              let ndwi = (sample.B08 - sample.B11) / (sample.B08 + sample.B11);
+              return [sample.B04 * 2.5, sample.B03 * 2.5, sample.B02 * 2.5, ndvi, ndwi];
             }
             """
 
@@ -83,22 +85,29 @@ if st.button('Pobierz stan roślin (NDVI)'):
                 raw_data = fetched_data[0]
                 
                 # --- PRZYGOTOWANIE TŁA CZARNO-BIAŁEGO ---
-                # Wyciągamy kolory widzialne i wycinamy do zakresu 0-1
                 rgb_image = np.clip(raw_data[:, :, :3], 0, 1)
-                
-                # Standardowa formuła matematyczna na zamianę RGB na odcienie szarości
-                # (Luminancja: 0.299 * Czerwony + 0.587 * Zielony + 0.114 * Niebieski)
                 grayscale_back = np.dot(rgb_image[...,:3], [0.299, 0.587, 0.114])
-                
-                # Zamieniamy szarą mapę znowu na format RGB (duplikujemy kanał szarości 3 razy)
-                # żeby matplotlib mógł go narysować jako zdjęcie.
                 grayscale_rgb = np.stack((grayscale_back,)*3, axis=-1)
                 
-                # --- PRZYGOTOWANIE NAKŁADKI NDVI ---
-                # Wyciągamy samą nakładkę NDVI (4 warstwa)
-                ndvi_image = raw_data[:, :, 3].copy()
+                # --- WYBÓR NAKŁADKI (NDVI czy NDWI) ---
+                if typ_analizy == "Kondycja roślin (NDVI)":
+                    mapa_warstwa = raw_data[:, :, 3].copy()
+                    paleta_kolorow = 'RdYlGn'
+                    zakres_min = 0.0
+                    zakres_max = 1.0
+                    etykieta_paska = 'Indeks NDVI (Zielony = Zdrowe)'
+                    tytul_mapy = f"Zdrowie Roślin (NDVI) | {start_dt} do {end_dt}"
+                    info_tekst = "💡 Intensywny zielony to mocna wegetacja. Czerwony to goła ziemia lub problem."
+                else:
+                    mapa_warstwa = raw_data[:, :, 4].copy()
+                    paleta_kolorow = 'BrBG'
+                    zakres_min = -0.2
+                    zakres_max = 0.6
+                    etykieta_paska = 'Indeks NDWI (Niebieski = Mokro, Brązowy = Sucho)'
+                    tytul_mapy = f"Wilgotność Terenu (NDWI) | {start_dt} do {end_dt}"
+                    info_tekst = "💧 Ciemny turkus to woda/mocne nawodnienie. Brąz to susza lub sucha gleba."
                 
-                # --- MASKOWANIE POLA (To co mieliśmy wcześniej) ---
+                # --- MASKOWANIE POLA ---
                 pixel_coords = []
                 for lon, lat in coords:
                     px = (lon - min_x) / (max_x - min_x) * 600
@@ -111,42 +120,26 @@ if st.button('Pobierz stan roślin (NDVI)'):
                 path = Path(pixel_coords)
                 mask = path.contains_points(points).reshape(600, 600)
                 
-                # Wszędzie tam, gdzie NIE MA pola, ustawiamy nakładkę NDVI na przezroczystą (NaN)
-                ndvi_image[~mask] = np.nan
+                # Używamy uniwersalnej zmiennej mapa_warstwa (żółty wężyk znika!)
+                mapa_warstwa[~mask] = np.nan
                 
-                # --- PROFI OBKREŚLENIE GRANIC POLA (Linia od linijki, ale celowa) ---
-                # Dodajemy cienką, czarną linię graniczną na NDVI, żeby zamaskować piksele
                 poly_path = np.array(pixel_coords)
                 
-                # -------------------------------
-                
                 # --- RYSOWANIE MAPY FINALNEJ ---
-                fig, ax = plt.subplots(figsize=(10, 10)) # Trochę większe zdjęcie
+                fig, ax = plt.subplots(figsize=(10, 10))
                 
-                # 1. Kładziemy tło CZARNO-BIAŁE (cała okolica)
                 ax.imshow(grayscale_rgb, interpolation='bicubic')
-                
-                # 2. Kładziemy KOLOROWĄ nakładkę NDVI (tylko na pole)
-                # Ustawiamy 'alpha=0.9', żeby kolory były nasycone, ale lekko przebijała struktura ziemi
-                im = ax.imshow(ndvi_image, cmap='RdYlGn', vmin=0, vmax=1, alpha=0.9, interpolation='bicubic')
-                
-                # 3. Dodajemy PROFI CZARNĄ LINIĘ na granice, żeby maska wyglądała ostro
+                im = ax.imshow(mapa_warstwa, cmap=paleta_kolorow, vmin=zakres_min, vmax=zakres_max, alpha=0.9, interpolation='bicubic')
                 ax.plot(poly_path[:, 0], poly_path[:, 1], color='black', linewidth=1.5, alpha=0.8)
                 
-                # Pasek z kolorami (fraction=0.046 pad=0.04 to złote proporcje, żeby nie psuł układu)
-                plt.colorbar(im, label='Indeks NDVI (Zielony = Zdrowe)', fraction=0.046, pad=0.04) 
-                
-                ax.set_title(f"Monitor Pola (NDVI) | Okres: {start_dt} do {end_dt}", fontsize=14, fontweight='bold')
+                plt.colorbar(im, label=etykieta_paska, fraction=0.046, pad=0.04) 
+                ax.set_title(tytul_mapy, fontsize=14, fontweight='bold')
                 ax.axis('off')
-                
-                # Poprawka estetyczna, żeby białe brzegi wykresu zniknęły
                 fig.patch.set_facecolor('white')
                 
                 st.pyplot(fig)
-                st.success("Nowa, stylistyczna mapa wygenerowana pomyślnie!")
-                st.info("💡 Interpretacja: Kolorowa nakładka pokazuje zdrowie uprawy na Twoim polu. Otoczenie jest czarno-białe dla kontekstu.")
+                st.success("Mapa wygenerowana pomyślnie!")
+                st.info(info_tekst)
 
         except Exception as e:
             st.error(f"Błąd podczas pobierania danych: {e}")
-            if "invalid_client" in str(e):
-                st.error("⚠️ PROBLEM Z KLUCZAMI: Wygeneruj nowy Client ID i Client Secret w panelu CDSE!")
