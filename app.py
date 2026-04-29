@@ -2,6 +2,7 @@ import streamlit as st
 from sentinelhub import SHConfig, SentinelHubRequest, DataCollection, BBox, CRS, MimeType
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import datetime
 from matplotlib.path import Path
 
@@ -35,9 +36,10 @@ st.title("🚜 Monitoring Pola: 40 ha")
 st.sidebar.header("Ustawienia")
 data_widoku = st.sidebar.date_input("Wybierz datę analizy", value=datetime.date(2026, 4, 15))
 st.sidebar.markdown("---")
+# DODANA NOWA OPCJA DO MENU!
 typ_analizy = st.sidebar.radio(
     "Wybierz rodzaj analizy:",
-    ("Kondycja roślin (NDVI)", "Wilgotność (NDWI)")
+    ("Kondycja roślin (NDVI)", "Wilgotność (NDWI)", "Strefy nawożenia (Zoning)")
 )
 
 if st.button('Pobierz analizę z satelity'):
@@ -84,30 +86,11 @@ if st.button('Pobierz analizę z satelity'):
             else:
                 raw_data = fetched_data[0]
                 
-                # --- PRZYGOTOWANIE TŁA CZARNO-BIAŁEGO ---
                 rgb_image = np.clip(raw_data[:, :, :3], 0, 1)
                 grayscale_back = np.dot(rgb_image[...,:3], [0.299, 0.587, 0.114])
                 grayscale_rgb = np.stack((grayscale_back,)*3, axis=-1)
                 
-                # --- WYBÓR NAKŁADKI (NDVI czy NDWI) ---
-                if typ_analizy == "Kondycja roślin (NDVI)":
-                    mapa_warstwa = raw_data[:, :, 3].copy()
-                    paleta_kolorow = 'RdYlGn'
-                    zakres_min = 0.0
-                    zakres_max = 1.0
-                    etykieta_paska = 'Indeks NDVI (Zielony = Zdrowe)'
-                    tytul_mapy = f"Zdrowie Roślin (NDVI) | {start_dt} do {end_dt}"
-                    info_tekst = "💡 Intensywny zielony to mocna wegetacja. Czerwony to goła ziemia lub problem."
-                else:
-                    mapa_warstwa = raw_data[:, :, 4].copy()
-                    paleta_kolorow = 'BrBG'
-                    zakres_min = -0.2
-                    zakres_max = 0.6
-                    etykieta_paska = 'Indeks NDWI (Niebieski = Mokro, Brązowy = Sucho)'
-                    tytul_mapy = f"Wilgotność Terenu (NDWI) | {start_dt} do {end_dt}"
-                    info_tekst = "💧 Ciemny turkus to woda/mocne nawodnienie. Brąz to susza lub sucha gleba."
-                
-                # --- MASKOWANIE POLA ---
+                # MASKOWANIE (Robimy to na początku, żeby algorytm nawozów liczył tylko pole, a nie drogę)
                 pixel_coords = []
                 for lon, lat in coords:
                     px = (lon - min_x) / (max_x - min_x) * 600
@@ -116,29 +99,79 @@ if st.button('Pobierz analizę z satelity'):
                     
                 x, y = np.meshgrid(np.arange(600), np.arange(600))
                 points = np.vstack((x.flatten(), y.flatten())).T
-                
                 path = Path(pixel_coords)
                 mask = path.contains_points(points).reshape(600, 600)
-                
-                # Używamy uniwersalnej zmiennej mapa_warstwa (żółty wężyk znika!)
-                mapa_warstwa[~mask] = np.nan
+
+                uzyj_stref = False # Flaga sprawdzająca, czy używamy twardych stref
+
+                # --- WYBÓR NAKŁADKI ---
+                if typ_analizy == "Kondycja roślin (NDVI)":
+                    mapa_warstwa = raw_data[:, :, 3].copy()
+                    mapa_warstwa[~mask] = np.nan
+                    paleta_kolorow = 'RdYlGn'
+                    zakres_min, zakres_max = 0.0, 1.0
+                    interpolacja = 'bicubic'
+                    tytul_mapy = f"Zdrowie Roślin (NDVI) | {start_dt} do {end_dt}"
+                    info_tekst = "💡 Intensywny zielony to mocna wegetacja. Czerwony to problem."
+
+                elif typ_analizy == "Wilgotność (NDWI)":
+                    mapa_warstwa = raw_data[:, :, 4].copy()
+                    mapa_warstwa[~mask] = np.nan
+                    paleta_kolorow = 'BrBG'
+                    zakres_min, zakres_max = -0.2, 0.6
+                    interpolacja = 'bicubic'
+                    tytul_mapy = f"Wilgotność Terenu (NDWI) | {start_dt} do {end_dt}"
+                    info_tekst = "💧 Ciemny turkus to mokro. Brąz to sucho."
+
+                else: # STREFY NAWOŻENIA (Nowa magia!)
+                    ndvi_raw = raw_data[:, :, 3].copy()
+                    ndvi_raw[~mask] = np.nan # Liczymy statystyki TYLKO dla pola
+                    
+                    # Matematyka: Dzielimy pole na 3 idealne strefy (Percentyle 33% i 66%)
+                    p33 = np.nanpercentile(ndvi_raw, 33)
+                    p66 = np.nanpercentile(ndvi_raw, 66)
+                    
+                    strefy = np.zeros_like(ndvi_raw)
+                    strefy[ndvi_raw <= p33] = 1 # Słaba
+                    strefy[(ndvi_raw > p33) & (ndvi_raw <= p66)] = 2 # Średnia
+                    strefy[ndvi_raw > p66] = 3 # Mocna
+                    strefy[~mask] = np.nan # Wyciszamy drogę
+                    
+                    mapa_warstwa = strefy
+                    # Tworzymy twardą paletę kolorów dla nawozów
+                    paleta_kolorow = mcolors.ListedColormap(['#d73027', '#fee08b', '#1a9850']) # Czerw, Żółty, Zielony
+                    bounds = [0.5, 1.5, 2.5, 3.5]
+                    norm = mcolors.BoundaryNorm(bounds, paleta_kolorow.N)
+                    uzyj_stref = True
+                    interpolacja = 'nearest' # Celowo wyłączamy wygładzanie! Rozsiewacz to nie pędzel.
+                    tytul_mapy = f"Strefy Nawożenia (VRA) | {start_dt} do {end_dt}"
+                    info_tekst = "🚜 Strefa Czerwona (1) to najsłabszy wigor. Strefa Zielona (3) to rośliny w super kondycji."
                 
                 poly_path = np.array(pixel_coords)
                 
                 # --- RYSOWANIE MAPY FINALNEJ ---
                 fig, ax = plt.subplots(figsize=(10, 10))
-                
                 ax.imshow(grayscale_rgb, interpolation='bicubic')
-                im = ax.imshow(mapa_warstwa, cmap=paleta_kolorow, vmin=zakres_min, vmax=zakres_max, alpha=0.9, interpolation='bicubic')
-                ax.plot(poly_path[:, 0], poly_path[:, 1], color='black', linewidth=1.5, alpha=0.8)
                 
-                plt.colorbar(im, label=etykieta_paska, fraction=0.046, pad=0.04) 
+                if uzyj_stref:
+                    # Specjalne rysowanie dla twardych stref z odpowiednią legendą
+                    im = ax.imshow(mapa_warstwa, cmap=paleta_kolorow, norm=norm, alpha=0.85, interpolation=interpolacja)
+                    cbar = plt.colorbar(im, fraction=0.046, pad=0.04, ticks=[1, 2, 3])
+                    cbar.set_ticklabels(['Strefa 1\n(Słaby wigor)', 'Strefa 2\n(Średniak)', 'Strefa 3\n(Mocny wigor)'])
+                    cbar.set_label('Rekomendacja działania')
+                else:
+                    # Rysowanie wygładzone dla NDVI i NDWI
+                    im = ax.imshow(mapa_warstwa, cmap=paleta_kolorow, vmin=zakres_min, vmax=zakres_max, alpha=0.9, interpolation=interpolacja)
+                    etykieta = 'Indeks NDVI (Zielony=Zdrowe)' if typ_analizy == "Kondycja roślin (NDVI)" else 'Indeks NDWI (Niebieski=Mokro)'
+                    plt.colorbar(im, label=etykieta, fraction=0.046, pad=0.04) 
+                
+                ax.plot(poly_path[:, 0], poly_path[:, 1], color='black', linewidth=1.5, alpha=0.8)
                 ax.set_title(tytul_mapy, fontsize=14, fontweight='bold')
                 ax.axis('off')
                 fig.patch.set_facecolor('white')
                 
                 st.pyplot(fig)
-                st.success("Mapa wygenerowana pomyślnie!")
+                st.success("Analiza wykonana pomyślnie!")
                 st.info(info_tekst)
 
         except Exception as e:
