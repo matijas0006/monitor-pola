@@ -3,6 +3,7 @@ from sentinelhub import SHConfig, SentinelHubRequest, DataCollection, BBox, CRS,
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
+from matplotlib.path import Path
 
 CDSE_S2L2A = DataCollection.define(
     name="Sentinel-2 L2A CDSE",
@@ -47,13 +48,14 @@ if st.button('Pobierz stan roślin (NDVI)'):
             //VERSION=3
             function setup() {
               return {
-                input: ["B04", "B08"],
-                output: { bands: 1, sampleType: "FLOAT32" }
+                input: ["B02", "B03", "B04", "B08"],
+                output: { bands: 4, sampleType: "FLOAT32" }
               };
             }
             function evaluatePixel(sample) {
               let ndvi = (sample.B08 - sample.B04) / (sample.B08 + sample.B04);
-              return [ndvi];
+              // Zwracamy pasma RGB (rozjaśnione *2.5) oraz NDVI w czwartej warstwie
+              return [sample.B04 * 2.5, sample.B03 * 2.5, sample.B02 * 2.5, ndvi];
             }
             """
 
@@ -78,18 +80,71 @@ if st.button('Pobierz stan roślin (NDVI)'):
             if not fetched_data:
                 st.warning("Brak bezchmurnych zdjęć w tym okresie. Spróbuj wybrać późniejszą datę.")
             else:
-                data = fetched_data[0]
+                raw_data = fetched_data[0]
                 
-                # Rysowanie mapy
-                fig, ax = plt.subplots(figsize=(8, 8))
-                im = ax.imshow(data, cmap='RdYlGn', vmin=0, vmax=1)
-                plt.colorbar(im, label='Indeks NDVI (Zielony = Zdrowe)')
-                ax.set_title(f"Kondycja pola w okresie {start_dt} do {end_dt}")
+                # --- PRZYGOTOWANIE TŁA CZARNO-BIAŁEGO ---
+                # Wyciągamy kolory widzialne i wycinamy do zakresu 0-1
+                rgb_image = np.clip(raw_data[:, :, :3], 0, 1)
+                
+                # Standardowa formuła matematyczna na zamianę RGB na odcienie szarości
+                # (Luminancja: 0.299 * Czerwony + 0.587 * Zielony + 0.114 * Niebieski)
+                grayscale_back = np.dot(rgb_image[...,:3], [0.299, 0.587, 0.114])
+                
+                # Zamieniamy szarą mapę znowu na format RGB (duplikujemy kanał szarości 3 razy)
+                # żeby matplotlib mógł go narysować jako zdjęcie.
+                grayscale_rgb = np.stack((grayscale_back,)*3, axis=-1)
+                
+                # --- PRZYGOTOWANIE NAKŁADKI NDVI ---
+                # Wyciągamy samą nakładkę NDVI (4 warstwa)
+                ndvi_image = raw_data[:, :, 3].copy()
+                
+                # --- MASKOWANIE POLA (To co mieliśmy wcześniej) ---
+                pixel_coords = []
+                for lon, lat in coords:
+                    px = (lon - min_x) / (max_x - min_x) * 600
+                    py = 600 - ((lat - min_y) / (max_y - min_y) * 600) 
+                    pixel_coords.append([px, py])
+                    
+                x, y = np.meshgrid(np.arange(600), np.arange(600))
+                points = np.vstack((x.flatten(), y.flatten())).T
+                
+                path = Path(pixel_coords)
+                mask = path.contains_points(points).reshape(600, 600)
+                
+                # Wszędzie tam, gdzie NIE MA pola, ustawiamy nakładkę NDVI na przezroczystą (NaN)
+                ndvi_image[~mask] = np.nan
+                
+                # --- PROFI OBKREŚLENIE GRANIC POLA (Linia od linijki, ale celowa) ---
+                # Dodajemy cienką, czarną linię graniczną na NDVI, żeby zamaskować piksele
+                poly_path = np.array(pixel_coords)
+                
+                # -------------------------------
+                
+                # --- RYSOWANIE MAPY FINALNEJ ---
+                fig, ax = plt.subplots(figsize=(10, 10)) # Trochę większe zdjęcie
+                
+                # 1. Kładziemy tło CZARNO-BIAŁE (cała okolica)
+                ax.imshow(grayscale_rgb, interpolation='bicubic')
+                
+                # 2. Kładziemy KOLOROWĄ nakładkę NDVI (tylko na pole)
+                # Ustawiamy 'alpha=0.9', żeby kolory były nasycone, ale lekko przebijała struktura ziemi
+                im = ax.imshow(ndvi_image, cmap='RdYlGn', vmin=0, vmax=1, alpha=0.9, interpolation='bicubic')
+                
+                # 3. Dodajemy PROFI CZARNĄ LINIĘ na granice, żeby maska wyglądała ostro
+                ax.plot(poly_path[:, 0], poly_path[:, 1], color='black', linewidth=1.5, alpha=0.8)
+                
+                # Pasek z kolorami (fraction=0.046 pad=0.04 to złote proporcje, żeby nie psuł układu)
+                plt.colorbar(im, label='Indeks NDVI (Zielony = Zdrowe)', fraction=0.046, pad=0.04) 
+                
+                ax.set_title(f"Monitor Pola (NDVI) | Okres: {start_dt} do {end_dt}", fontsize=14, fontweight='bold')
                 ax.axis('off')
                 
+                # Poprawka estetyczna, żeby białe brzegi wykresu zniknęły
+                fig.patch.set_facecolor('white')
+                
                 st.pyplot(fig)
-                st.success("Mapa wygenerowana pomyślnie!")
-                st.info("💡 Interpretacja: Intensywny zielony to mocne wschody. Czerwony to goła ziemia lub problem.")
+                st.success("Nowa, stylistyczna mapa wygenerowana pomyślnie!")
+                st.info("💡 Interpretacja: Kolorowa nakładka pokazuje zdrowie uprawy na Twoim polu. Otoczenie jest czarno-białe dla kontekstu.")
 
         except Exception as e:
             st.error(f"Błąd podczas pobierania danych: {e}")
